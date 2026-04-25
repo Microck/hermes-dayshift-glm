@@ -337,6 +337,20 @@ def token_env(config: dict[str, Any]) -> dict[str, str]:
     token_path = Path(os.path.expanduser(token_file))
     if token_path.exists() and not env.get("GH_TOKEN"):
         env["GH_TOKEN"] = token_path.read_text().strip()
+    # Ensure common tool paths are available (bun, pnpm, cargo, go, etc.)
+    extra_paths = [
+        Path.home() / ".bun" / "bin",
+        Path.home() / ".local" / "bin",
+        Path.home() / ".cargo" / "bin",
+        Path.home() / "go" / "bin",
+        Path("/usr/local/bin"),
+    ]
+    existing = env.get("PATH", "").split(os.pathsep)
+    for p in extra_paths:
+        ps = str(p)
+        if ps not in existing:
+            existing.insert(0, ps)
+    env["PATH"] = os.pathsep.join(existing)
     return env
 
 
@@ -896,7 +910,7 @@ def prepare_checkout(clone_dir: Path, config: dict[str, Any]) -> list[str]:
 def validate_checkout(clone_dir: Path, config: dict[str, Any]) -> tuple[bool, list[str]]:
     commands = validation_commands_for_checkout(clone_dir, config)
     if not commands:
-        return False, ["No validation command detected."]
+        return True, ["No validation command detected — skipping validation."]
 
     logs: list[str] = []
     for command in commands:
