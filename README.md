@@ -1,4 +1,5 @@
 <div align="center">
+  <img src="./logo.png" alt="hermes-dayshift-glm" width="300">
 
 <h1>hermes-dayshift-glm</h1>
 </div>
@@ -17,13 +18,13 @@
 
 ## how it works
 
-1. **scan** — reads open GitHub issues and PRs that look like Nightshift output
-2. **classify** — scores each item for fixability, risk, effort, and approval path
-3. **triage** — stores local state in `~/.dayshift/state.json` and renders a jKanban board
-4. **approve** — human moves cards into model-specific execution lanes
-5. **execute** — runs Codex or Hermes/GLM with the issue or PR context
-6. **validate** — installs lockfile dependencies when needed and runs detected tests/checks
-7. **output** — issue cards create Dayshift PRs; PR cards can be repaired or merged when policy allows
+1. **scan**: reads open GitHub issues and PRs that look like Nightshift output
+2. **classify**: scores each item for fixability, risk, effort, and approval path
+3. **triage**: stores local state in `~/.dayshift/state.json` and renders a jKanban board
+4. **approve**: human moves cards into model-specific execution lanes
+5. **execute**: runs Codex or Hermes/GLM with the issue or PR context
+6. **validate**: installs lockfile dependencies when needed and runs detected tests/checks
+7. **output**: issue cards create Dayshift PRs; PR cards can be repaired or merged when policy allows
 
 ## architecture
 
@@ -35,10 +36,10 @@ scan ──→ classify ──→ board ──→ execution lane ──→ agent
                   └──── local state ┘                         └── failed → retry lane
 ```
 
-- **local board state is the source of truth** — GitHub labels are best-effort sync, but stale labels do not override local moves
-- **execution lanes are explicit** — a lane chooses model, command, run policy, reasoning effort, and whether to merge after execution
-- **terminal work stays off the board** — closed, merged, skipped, ignored, and done records remain in state but do not clutter kanban
-- **failed means real execution failure** — label sync noise is hidden and missing old labels are treated as already-clean
+- **local board state is the source of truth**: GitHub labels are best-effort sync, but stale labels do not override local moves
+- **execution lanes are explicit**: a lane chooses model, command, run policy, reasoning effort, and whether to merge after execution
+- **terminal work stays off the board**: closed, merged, skipped, ignored, and done records remain in state but do not clutter kanban
+- **failed means real execution failure**: label sync noise is hidden and missing old labels are treated as already-clean
 
 ## quickstart
 
