@@ -12,6 +12,8 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-mit-000000?style=flat-square" alt="license badge"></a>
 </p>
 
+<img width="1719" height="884" alt="screenshot1869_00-07-26-04-2026" src="https://github.com/user-attachments/assets/2b4e346b-d4e2-48a8-bdd8-268eede88b9d" />
+
 ---
 
 `dayshift` is the companion implementer for [`hermes-nightshift-glm`](https://github.com/Microck/hermes-nightshift-glm). Nightshift creates issues and PRs. Dayshift scans those outputs, classifies what is actionable, puts them on a local kanban board, and only runs an executor after a human moves a card into an execution lane.
