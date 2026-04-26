@@ -101,15 +101,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "label": "dayshift/execute-gpt-5-3-codex",
             "title": "execute: GPT 5.3 Codex",
             "model": "gpt-5.3-codex",
-            "agent_command": "",
+            "agent_command": CODEX_AGENT_COMMAND,
             "run_policy": "immediate",
-            "reasoning_effort": "high",
+            "reasoning_effort": "",
             "execute_and_merge": False,
         },
     ],
     "scheduler_enabled": True,
     "scheduler_interval_seconds": 30,
-    "scheduler_max_items": 1,
+    "scheduler_max_items": 0,
     "glm_quota_command": "python3 ~/nightshift-workspace/glm_quota.py --check",
     "validation_commands": [],
     "merge_method": "squash",
@@ -1489,10 +1489,15 @@ def run_ready_items(config: dict[str, Any], *, respect_run_policy: bool = False,
         classification = classifications[item.key]
         workflow_state = record_label or next((label for label in item.labels if label in workflow_labels(config)), None)
         execution_label = workflow_state if workflow_state in lane_labels else None
-        if execution_label is None and item.kind == "issue" and record.get("result_url") and workflow_state == "dayshift/failed":
+        if execution_label is None:
             fallback_execution_label = record.get("execution_label")
             if fallback_execution_label in lane_labels:
-                execution_label = fallback_execution_label
+                should_reuse_lane = (
+                    (item.kind == "issue" and record.get("result_url") and workflow_state == "dayshift/failed")
+                    or (item.kind == "pr" and workflow_state in {"dayshift/ready", "dayshift/failed", "dayshift/merge"})
+                )
+                if should_reuse_lane:
+                    execution_label = fallback_execution_label
         should_reconcile_existing_pr = item.kind == "issue" and workflow_state == "dayshift/failed" and bool(record.get("result_url")) and execution_label is not None
         should_run = workflow_state == "dayshift/ready" or (item.kind == "issue" and (workflow_state in lane_labels or should_reconcile_existing_pr))
         if not config.get("kanban_enabled", True) and classification.verdict == "auto-fix":
