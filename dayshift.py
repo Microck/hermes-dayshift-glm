@@ -109,6 +109,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ],
     "scheduler_enabled": True,
     "scheduler_interval_seconds": 30,
+    "scheduler_max_items": 1,
     "glm_quota_command": "python3 ~/nightshift-workspace/glm_quota.py --check",
     "validation_commands": [],
     "merge_method": "squash",
@@ -264,8 +265,8 @@ def load_config() -> dict[str, Any]:
             raise ValueError("execution lane model is required")
         if lane.get("run_policy", "immediate") not in {"immediate", "glm_quota_window"}:
             raise ValueError("execution lane run_policy must be immediate or glm_quota_window")
-        if lane.get("reasoning_effort", "medium") not in {"low", "medium", "high", "xhigh"}:
-            raise ValueError("execution lane reasoning_effort must be low, medium, high, or xhigh")
+        if lane.get("reasoning_effort", "medium") not in {"", "low", "medium", "high", "xhigh"}:
+            raise ValueError("execution lane reasoning_effort must be empty, low, medium, high, or xhigh")
     if not isinstance(config.get("scheduler_enabled"), bool):
         raise ValueError("scheduler_enabled must be true or false")
     if not isinstance(config.get("scheduler_interval_seconds"), int) or config["scheduler_interval_seconds"] < 1:
@@ -278,14 +279,17 @@ def load_config() -> dict[str, Any]:
 def execution_lanes(config: dict[str, Any]) -> list[dict[str, str]]:
     lanes = []
     for lane in config.get("execution_lanes", []):
+        agent_command = lane["agent_command"] if "agent_command" in lane and lane["agent_command"] is not None else (config.get("agent_command") or "")
+        run_policy = lane["run_policy"] if "run_policy" in lane and lane["run_policy"] is not None else ("glm_quota_window" if str(lane["model"]).startswith("glm") else "immediate")
+        reasoning_effort = lane["reasoning_effort"] if "reasoning_effort" in lane and lane["reasoning_effort"] is not None else ("high" if str(lane["model"]) == "gpt-5.3-codex" else "medium")
         lanes.append(
             {
                 "label": str(lane["label"]),
                 "title": str(lane["title"]),
                 "model": str(lane["model"]),
-                "agent_command": str(lane.get("agent_command") or config.get("agent_command") or ""),
-                "run_policy": str(lane.get("run_policy") or ("glm_quota_window" if str(lane["model"]).startswith("glm") else "immediate")),
-                "reasoning_effort": str(lane.get("reasoning_effort") or ("high" if str(lane["model"]) == "gpt-5.3-codex" else "medium")),
+                "agent_command": str(agent_command),
+                "run_policy": str(run_policy),
+                "reasoning_effort": str(reasoning_effort),
                 "execute_and_merge": bool(lane.get("execute_and_merge", False)),
             }
         )
@@ -333,10 +337,33 @@ def save_state(state: dict[str, Any]) -> None:
 
 def token_env(config: dict[str, Any]) -> dict[str, str]:
     env = os.environ.copy()
-    token_file = config["nightshift_token_file"] if config.get("reuse_nightshift_token") else config["github_token_file"]
-    token_path = Path(os.path.expanduser(token_file))
-    if token_path.exists() and not env.get("GH_TOKEN"):
-        env["GH_TOKEN"] = token_path.read_text().strip()
+    env.pop("GH_TOKEN", None)
+    env.pop("GITHUB_TOKEN", None)
+
+    token_file = ""
+    if config.get("reuse_nightshift_token"):
+        token_file = str(config.get("nightshift_token_file", "")).strip()
+    else:
+        github_token_file = str(config.get("github_token_file", "")).strip()
+        nightshift_token_file = str(config.get("nightshift_token_file", "")).strip()
+        github_token_path = Path(os.path.expanduser(github_token_file)) if github_token_file else None
+        nightshift_token_path = Path(os.path.expanduser(nightshift_token_file)) if nightshift_token_file else None
+        if github_token_path and github_token_path.is_file():
+            token_file = github_token_file
+            if nightshift_token_path and nightshift_token_path.is_file():
+                try:
+                    if github_token_path.read_text().strip() == nightshift_token_path.read_text().strip():
+                        token_file = ""
+                except OSError:
+                    pass
+
+    if token_file:
+        token_path = Path(os.path.expanduser(token_file))
+        if token_path.is_file():
+            token_value = token_path.read_text().strip()
+            if token_value:
+                env["GH_TOKEN"] = token_value
+                env["GITHUB_TOKEN"] = token_value
     # Ensure common tool paths are available (bun, pnpm, cargo, go, etc.)
     extra_paths = [
         Path.home() / ".bun" / "bin",
@@ -684,14 +711,18 @@ def set_workflow_label(item: WorkItem, label: str, config: dict[str, Any]) -> No
             try:
                 gh_api(f"/repos/{item.repo}/issues/{item.number}/labels/{encoded}", config, method="DELETE")
             except RuntimeError as exc:
-                # GitHub can return 404 when Dayshift's local state still lists a
-                # workflow label that has already disappeared upstream. That is
-                # already the desired state, so do not poison the card with a
-                # label_sync_error or make it look like executor work failed.
-                if "Label does not exist" not in str(exc):
+                msg = str(exc)
+                if "Label does not exist" not in msg and "Must have admin rights" not in msg and "403" not in msg:
                     raise
+                print(f"  [warn] Could not remove label '{existing}' on {item.repo}#{item.number}: {msg}")
     if label not in item.labels:
-        gh_api(f"/repos/{item.repo}/issues/{item.number}/labels", config, method="POST", json_body={"labels": [label]})
+        try:
+            gh_api(f"/repos/{item.repo}/issues/{item.number}/labels", config, method="POST", json_body={"labels": [label]})
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "Must have admin rights" not in msg and "403" not in msg:
+                raise
+            print(f"  [warn] Could not add label '{label}' on {item.repo}#{item.number}: {msg}")
 
 
 def save_human_note(key: str, note: str) -> dict[str, Any]:
@@ -753,7 +784,15 @@ def sync_scan(config: dict[str, Any], *, apply_labels: bool = False) -> tuple[li
                 }
             )
             if apply_labels and not set(item.labels) & DAYSHIFT_LABELS:
-                set_workflow_label(item, default_inbox_label(item), config)
+                try:
+                    set_workflow_label(item, default_inbox_label(item), config)
+                    record.pop("label_sync_error", None)
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    if any(marker in msg for marker in ("admin rights", "403", "Label does not exist", "404")):
+                        record["label_sync_error"] = msg
+                    else:
+                        raise
 
     state["last_scan"] = now_iso()
     save_state(state)
@@ -863,6 +902,111 @@ def run_agent(item: WorkItem, classification: Classification, clone_dir: Path, c
         Path(prompt_path).unlink(missing_ok=True)
 
 
+def git_head_sha(clone_dir: Path) -> str:
+    result = run_command(["git", "rev-parse", "HEAD"], cwd=clone_dir)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "could not determine git HEAD")
+    return result.stdout.strip()
+
+
+def conflicted_files(clone_dir: Path) -> list[str]:
+    result = run_command(["git", "diff", "--name-only", "--diff-filter=U"], cwd=clone_dir)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "could not list conflicted files")
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def abort_rebase(clone_dir: Path) -> None:
+    result = run_command(["git", "rebase", "--abort"], cwd=clone_dir)
+    if result.returncode != 0:
+        status = run_command(["git", "status", "--short"], cwd=clone_dir)
+        details = (status.stdout + status.stderr).strip()
+        message = result.stderr.strip() or "git rebase --abort failed"
+        if details:
+            message = f"{message}\n{details}"
+        raise RuntimeError(message)
+
+
+def config_with_human_note(config: dict[str, Any], note: str) -> dict[str, Any]:
+    merged = dict(config)
+    existing = str(config.get("human_note") or "").strip()
+    merged["human_note"] = f"{existing}\n\n{note}".strip() if existing else note.strip()
+    return merged
+
+
+def rebase_pr_branch_onto_base(item: WorkItem, classification: Classification, clone_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    if not item.base_ref:
+        return {"attempted": False, "detail": "PR base ref is missing"}
+
+    fetch = run_command(["git", "fetch", "origin", item.base_ref], cwd=clone_dir, env=token_env(config))
+    if fetch.returncode != 0:
+        raise RuntimeError(fetch.stderr.strip() or f"could not fetch origin/{item.base_ref}")
+
+    before_head = git_head_sha(clone_dir)
+    rebase = run_command(["git", "rebase", f"origin/{item.base_ref}"], cwd=clone_dir)
+    if rebase.returncode == 0:
+        after_head = git_head_sha(clone_dir)
+        return {
+            "attempted": True,
+            "resolved": True,
+            "used_agent": False,
+            "base_ref": item.base_ref,
+            "rewrote_history": before_head != after_head,
+            "detail": f"rebased onto origin/{item.base_ref}",
+        }
+
+    initial_conflicts = conflicted_files(clone_dir)
+    if not initial_conflicts:
+        abort_rebase(clone_dir)
+        raise RuntimeError(rebase.stderr.strip() or rebase.stdout.strip() or f"git rebase origin/{item.base_ref} failed")
+
+    max_attempts = 3
+    current_conflicts = initial_conflicts
+    for attempt in range(1, max_attempts + 1):
+        note = textwrap.dedent(
+            f"""
+            The PR branch hit merge conflicts while rebasing onto origin/{item.base_ref}.
+
+            Resolve the conflicts so the rebase can continue.
+            Conflicted files:
+            {chr(10).join(f'- {path}' for path in current_conflicts)}
+
+            Requirements:
+            - Remove all conflict markers.
+            - Preserve the Nightshift PR intent while incorporating the latest base-branch changes.
+            - Keep the fix targeted.
+            - Leave the repository ready for `git rebase --continue`.
+            """
+        ).strip()
+        run_agent(item, classification, clone_dir, config_with_human_note(config, note))
+        run_command(["git", "add", "-A"], cwd=clone_dir, check=True)
+        continue_env = dict(os.environ)
+        continue_env["GIT_EDITOR"] = "true"
+        cont = run_command(["git", "rebase", "--continue"], cwd=clone_dir, env=continue_env)
+        if cont.returncode == 0:
+            after_head = git_head_sha(clone_dir)
+            return {
+                "attempted": True,
+                "resolved": True,
+                "used_agent": True,
+                "attempts": attempt,
+                "base_ref": item.base_ref,
+                "conflicted_files": initial_conflicts,
+                "rewrote_history": before_head != after_head,
+                "detail": f"resolved rebase conflicts onto origin/{item.base_ref}",
+            }
+        current_conflicts = conflicted_files(clone_dir)
+        if not current_conflicts:
+            abort_rebase(clone_dir)
+            raise RuntimeError(cont.stderr.strip() or cont.stdout.strip() or "git rebase --continue failed")
+
+    abort_rebase(clone_dir)
+    raise RuntimeError(
+        f"could not resolve rebase conflicts onto origin/{item.base_ref} after {max_attempts} attempt(s): "
+        + ", ".join(current_conflicts)
+    )
+
+
 def dependency_install_commands(clone_dir: Path) -> list[str]:
     if not (clone_dir / "package.json").exists() or (clone_dir / "node_modules").exists():
         return []
@@ -884,17 +1028,72 @@ def validation_commands_for_checkout(clone_dir: Path, config: dict[str, Any]) ->
     has_python_tests = any(clone_dir.glob("test_*.py")) or any((clone_dir / "tests").glob("**/test_*.py"))
     if has_python_tests:
         return ["python3 -m unittest discover"]
-    if (clone_dir / "package.json").exists() and (clone_dir / "pnpm-lock.yaml").exists():
-        return ["pnpm test"]
-    if (clone_dir / "package.json").exists() and ((clone_dir / "bun.lock").exists() or (clone_dir / "bun.lockb").exists()):
-        return ["bun test"]
-    if (clone_dir / "package.json").exists() and (clone_dir / "yarn.lock").exists():
-        return ["yarn test"]
-    if (clone_dir / "package.json").exists() and (clone_dir / "package-lock.json").exists():
-        return ["npm test"]
+    package_json = clone_dir / "package.json"
+    package_data: dict[str, Any] = {}
+    if package_json.exists():
+        try:
+            package_data = json.loads(package_json.read_text())
+        except Exception:
+            package_data = {}
+    scripts = package_data.get("scripts") if isinstance(package_data, dict) else {}
+    if isinstance(scripts, dict):
+        if scripts.get("test"):
+            if (clone_dir / "pnpm-lock.yaml").exists():
+                return ["pnpm test"]
+            if (clone_dir / "bun.lock").exists() or (clone_dir / "bun.lockb").exists():
+                return ["bun test"]
+            if (clone_dir / "yarn.lock").exists():
+                return ["yarn test"]
+            if (clone_dir / "package-lock.json").exists():
+                return ["npm test"]
+        if scripts.get("typecheck"):
+            if (clone_dir / "pnpm-lock.yaml").exists():
+                return ["pnpm typecheck"]
+            if (clone_dir / "bun.lock").exists() or (clone_dir / "bun.lockb").exists():
+                return ["bun run typecheck"]
+            if (clone_dir / "yarn.lock").exists():
+                return ["yarn typecheck"]
+            if (clone_dir / "package-lock.json").exists():
+                return ["npm run typecheck"]
+        if scripts.get("build"):
+            if (clone_dir / "pnpm-lock.yaml").exists():
+                return ["pnpm build"]
+            if (clone_dir / "bun.lock").exists() or (clone_dir / "bun.lockb").exists():
+                return ["bun run build"]
+            if (clone_dir / "yarn.lock").exists():
+                return ["yarn build"]
+            if (clone_dir / "package-lock.json").exists():
+                return ["npm run build"]
     if (clone_dir / "CMakeLists.txt").exists():
         return ["cmake -S . -B build", "cmake --build build", "ctest --test-dir build --output-on-failure"]
     return []
+
+
+def normalize_node_tool_permissions(clone_dir: Path) -> list[str]:
+    logs: list[str] = []
+    if not (clone_dir / "package.json").exists() or not (clone_dir / "node_modules").exists():
+        return logs
+    candidates: list[Path] = []
+    candidates.extend(path for path in (clone_dir / "node_modules" / ".bin").glob("*") if path.is_file())
+    for subdir in ("bin", "dist/bin"):
+        candidates.extend(path for path in (clone_dir / "node_modules").glob(f"*/{subdir}/*") if path.is_file())
+    fixed = 0
+    seen: set[Path] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            mode = path.stat().st_mode
+            if mode & 0o111:
+                continue
+            path.chmod(mode | 0o755)
+            fixed += 1
+        except OSError:
+            continue
+    if fixed:
+        logs.append(f"Normalized executable bits on {fixed} Node tool file(s).")
+    return logs
 
 
 def prepare_checkout(clone_dir: Path, config: dict[str, Any]) -> list[str]:
@@ -904,6 +1103,7 @@ def prepare_checkout(clone_dir: Path, config: dict[str, Any]) -> list[str]:
         logs.append(f"$ {command}\n{result.stdout}{result.stderr}".strip())
         if result.returncode != 0:
             raise RuntimeError(logs[-1])
+    logs.extend(normalize_node_tool_permissions(clone_dir))
     return logs
 
 
@@ -944,6 +1144,9 @@ def repair_pr_branch(item: WorkItem, classification: Classification, config: dic
     if checkout.returncode != 0:
         raise RuntimeError(checkout.stderr.strip() or f"could not checkout {item.head_ref}")
 
+    original_head = git_head_sha(clone_dir)
+    rebase_result = rebase_pr_branch_onto_base(item, classification, clone_dir, config)
+    prepare_checkout(clone_dir, config)
     run_agent(item, classification, clone_dir, config)
     valid, logs = validate_checkout(clone_dir, config)
     if not valid:
@@ -953,12 +1156,26 @@ def repair_pr_branch(item: WorkItem, classification: Classification, config: dic
         clone_dir,
         f"fix: repair nightshift PR {item.number}\n\nDayshift-Source: {item.repo}#{item.number}",
     )
-    if committed:
-        push = run_command(["git", "push", "origin", f"HEAD:{item.head_ref}"], cwd=clone_dir, env=token_env(config))
+    final_head = git_head_sha(clone_dir)
+    history_rewritten = bool(rebase_result.get("rewrote_history"))
+    should_push = committed or final_head != original_head
+    if should_push:
+        push_args = ["git", "push"]
+        if history_rewritten:
+            push_args.append("--force-with-lease")
+        push_args.extend(["origin", f"HEAD:{item.head_ref}"])
+        push = run_command(push_args, cwd=clone_dir, env=token_env(config))
         if push.returncode != 0:
             raise RuntimeError(push.stderr.strip() or "push failed")
-        return {"repaired": True, "detail": "pushed repair commit"}
-    return {"repaired": False, "detail": "agent made no changes"}
+        detail_parts = []
+        if history_rewritten:
+            detail_parts.append(str(rebase_result.get("detail") or "rebased PR branch onto latest base"))
+        if committed:
+            detail_parts.append("pushed repair commit")
+        elif final_head != original_head:
+            detail_parts.append("pushed rebased branch")
+        return {"repaired": True, "detail": "; ".join(detail_parts), "rebase": rebase_result}
+    return {"repaired": False, "detail": "agent made no changes", "rebase": rebase_result}
 
 
 def can_auto_merge(item: WorkItem, config: dict[str, Any], *, approved_by_label: bool) -> bool:
@@ -987,6 +1204,9 @@ def github_checks_pass(repo: str, pr_number: int, config: dict[str, Any]) -> tup
     payload = json.loads(status.stdout)
     checks = payload.get("statusCheckRollup") or []
     if not checks:
+        merge_state_status = str(payload.get("mergeStateStatus") or "").upper()
+        if merge_state_status in {"CLEAN", "HAS_HOOKS", "UNSTABLE", "UNKNOWN"}:
+            return True, "no GitHub checks reported"
         return False, "no GitHub checks reported"
     failed = [check for check in checks if check.get("conclusion") not in {"SUCCESS", "SKIPPED"} and check.get("status") != "COMPLETED"]
     if failed:
@@ -1028,6 +1248,9 @@ def move_work_item(key: str, label: str, config: dict[str, Any]) -> dict[str, An
     except Exception as exc:
         record["label_sync_error"] = str(exc)
     record["workflow_label"] = label
+    if label in execution_lane_labels(config):
+        record["execution_label"] = label
+        record["execution_model"] = config_for_execution_label(config, label).get("selected_model")
     record["last_moved_at"] = now_iso()
     save_state(state)
     return {"status": "moved", "item": key, "label": label}
@@ -1131,8 +1354,9 @@ def act_on_item(item: WorkItem, classification: Classification, config: dict[str
         else:
             approved = "dayshift/merge" in item.labels
             checks_ok, checks_reason = github_checks_pass(item.repo, item.number, config)
-            if not checks_ok and ("dayshift/ready" in item.labels or approved or can_auto_merge(item, config, approved_by_label=False)):
-                record["repair"] = repair_pr_branch(item, classification, config)
+            should_attempt_repair = bool(execution_label) or "dayshift/ready" in item.labels or approved
+            if not checks_ok and should_attempt_repair:
+                record["repair"] = repair_pr_branch(item, classification, execution_config)
                 checks_ok, checks_reason = github_checks_pass(item.repo, item.number, config)
             if checks_ok and can_auto_merge(item, config, approved_by_label=approved):
                 merge_output = merge_pr(item, config)
@@ -1204,6 +1428,7 @@ def run_ready_items(config: dict[str, Any], *, respect_run_policy: bool = False,
     lanes = lane_by_label(config)
     lane_labels = set(lanes)
     quota_cache: dict[str, tuple[bool, str]] = {}
+    max_items = int(config.get("scheduler_max_items", 0) or 0) if respect_run_policy else 0
     for item in items:
         state = load_state()
         record = state.get("items", {}).get(item.key, {})
@@ -1215,6 +1440,10 @@ def run_ready_items(config: dict[str, Any], *, respect_run_policy: bool = False,
             labels.add(record_label)
         classification = classifications[item.key]
         execution_label = next((label for label in labels if label in lane_labels), None)
+        if execution_label is None:
+            fallback_execution_label = record.get("execution_label")
+            if fallback_execution_label in lane_labels:
+                execution_label = fallback_execution_label
         should_run = "dayshift/ready" in labels or (item.kind == "issue" and execution_label is not None)
         if not config.get("kanban_enabled", True) and classification.verdict == "auto-fix":
             should_run = True
@@ -1234,6 +1463,8 @@ def run_ready_items(config: dict[str, Any], *, respect_run_policy: bool = False,
             state.setdefault("items", {}).setdefault(item.key, {}).pop("scheduler_waiting", None)
             save_state(state)
         outcomes.append({"item": item.key, **act_on_item(item, classification, config, execution_label)})
+        if max_items and len(outcomes) >= max_items:
+            break
         if respect_run_policy and execution_label and lanes[execution_label].get("run_policy") == "glm_quota_window" and is_quota_wait_error(outcomes[-1]):
             state = load_state()
             record = state.setdefault("items", {}).setdefault(item.key, {})
@@ -1685,8 +1916,8 @@ def parse_settings_form(form: dict[str, str], base_config: dict[str, Any]) -> di
             raise ValueError("execution lane model is required")
         if lane.get("run_policy", "immediate") not in {"immediate", "glm_quota_window"}:
             raise ValueError("execution lane run_policy must be immediate or glm_quota_window")
-        if lane.get("reasoning_effort", "medium") not in {"low", "medium", "high", "xhigh"}:
-            raise ValueError("execution lane reasoning_effort must be low, medium, high, or xhigh")
+        if lane.get("reasoning_effort", "medium") not in {"", "low", "medium", "high", "xhigh"}:
+            raise ValueError("execution lane reasoning_effort must be empty, low, medium, high, or xhigh")
     return config
 
 
@@ -2165,7 +2396,7 @@ def main(argv: list[str] | None = None) -> int:
         print_items(items, classifications)
         return 0
     if args.command == "run":
-        print(json.dumps(run_ready_items(config), indent=2))
+        print(json.dumps(run_scheduled_items(config), indent=2))
         return 0
     if args.command == "serve":
         serve(config, args.host, args.port)
