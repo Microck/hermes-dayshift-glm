@@ -1308,6 +1308,32 @@ def maybe_merge_created_pr(pr_url: str, source_item: WorkItem, config: dict[str,
     record["post_execute_merge"] = merge_pr(pr_item, config)
 
 
+def reconcile_existing_issue_pr(item: WorkItem, config: dict[str, Any], record: dict[str, Any]) -> dict[str, Any] | None:
+    pr_url = str(record.get("result_url") or "").strip()
+    if not pr_url:
+        return None
+    pr_number = parse_pr_number_from_url(pr_url)
+    if not pr_number:
+        return None
+    pr_data = gh_api(f"/repos/{item.repo}/pulls/{pr_number}", config)
+    if not isinstance(pr_data, dict):
+        return None
+    if pr_data.get("state") != "open":
+        if pr_data.get("merged_at"):
+            record["post_execute_merge"] = "PR already merged"
+            return {"status": "done", "url": pr_url}
+        record.pop("result_url", None)
+        record["post_execute_merge"] = "existing Dayshift PR was closed without merge; retrying"
+        return None
+    if config.get("selected_execute_and_merge"):
+        maybe_merge_created_pr(pr_url, item, config, record)
+        post_execute_merge = str(record.get("post_execute_merge") or "")
+        if post_execute_merge and not post_execute_merge.lower().startswith("waiting for checks:"):
+            return {"status": "done", "url": pr_url, "detail": post_execute_merge}
+        return {"status": "ready", "url": pr_url, "detail": post_execute_merge or "existing Dayshift PR still open"}
+    return {"status": "done", "url": pr_url, "detail": "existing Dayshift PR already created"}
+
+
 def act_on_item(item: WorkItem, classification: Classification, config: dict[str, Any], execution_label: str | None = None) -> dict[str, Any]:
     state = load_state()
     record = state.setdefault("items", {}).setdefault(item.key, {})
@@ -1324,33 +1350,55 @@ def act_on_item(item: WorkItem, classification: Classification, config: dict[str
         execution_config = config_for_execution_label(config, execution_label)
         execution_config["human_note"] = record.get("human_note", "")
         if item.kind == "issue":
-            clone_dir = clone_repo(item.repo, config)
-            branch = f"dayshift/issue-{item.number}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
-            run_command(["git", "checkout", "-b", branch], cwd=clone_dir, check=True)
-            prepare_checkout(clone_dir, execution_config)
-            run_agent(item, classification, clone_dir, execution_config)
-            valid, logs = validate_checkout(clone_dir, execution_config)
-            if not valid:
-                raise RuntimeError(logs[-1] if logs else "validation failed")
-            committed = commit_all_changes(
-                clone_dir,
-                f"fix: resolve nightshift issue {item.number}\n\nDayshift-Source: {item.repo}#{item.number}",
-            )
-            if not committed:
-                raise RuntimeError("agent made no changes")
-            push = run_command(["git", "push", "-u", "origin", branch], cwd=clone_dir, env=token_env(execution_config))
-            if push.returncode != 0:
-                raise RuntimeError(push.stderr.strip() or "push failed")
-            body = f"Automated by Dayshift from Nightshift issue #{item.number}.\n\nValidation passed locally."
-            pr = run_command(["gh", "pr", "create", "-R", item.repo, "--title", f"[dayshift] fix issue {item.number}: {item.title}", "--body", body], cwd=clone_dir, env=token_env(execution_config))
-            if pr.returncode != 0:
-                raise RuntimeError(pr.stderr.strip() or "PR create failed")
-            record["result_url"] = pr.stdout.strip()
-            if execution_config.get("selected_execute_and_merge"):
-                maybe_merge_created_pr(pr.stdout.strip(), item, execution_config, record)
-            set_workflow_label(item, "dayshift/done", config)
-            record["workflow_label"] = "dayshift/done"
-            outcome = {"status": "done", "url": pr.stdout.strip()}
+            existing_pr_outcome = reconcile_existing_issue_pr(item, execution_config, record)
+            if existing_pr_outcome is not None:
+                if existing_pr_outcome["status"] == "done":
+                    next_label = "dayshift/done"
+                else:
+                    next_label = execution_label or "dayshift/ready"
+                set_workflow_label(item, next_label, config)
+                record["workflow_label"] = next_label
+                outcome = existing_pr_outcome
+            else:
+                clone_dir = clone_repo(item.repo, config)
+                branch = f"dayshift/issue-{item.number}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
+                run_command(["git", "checkout", "-b", branch], cwd=clone_dir, check=True)
+                prepare_checkout(clone_dir, execution_config)
+                run_agent(item, classification, clone_dir, execution_config)
+                valid, logs = validate_checkout(clone_dir, execution_config)
+                if not valid:
+                    raise RuntimeError(logs[-1] if logs else "validation failed")
+                committed = commit_all_changes(
+                    clone_dir,
+                    f"fix: resolve nightshift issue {item.number}\n\nDayshift-Source: {item.repo}#{item.number}",
+                )
+                if not committed:
+                    raise RuntimeError("agent made no changes")
+                push = run_command(["git", "push", "-u", "origin", branch], cwd=clone_dir, env=token_env(execution_config))
+                if push.returncode != 0:
+                    raise RuntimeError(push.stderr.strip() or "push failed")
+                body = f"Automated by Dayshift from Nightshift issue #{item.number}.\n\nValidation passed locally."
+                pr = run_command(["gh", "pr", "create", "-R", item.repo, "--title", f"[dayshift] fix issue {item.number}: {item.title}", "--body", body], cwd=clone_dir, env=token_env(execution_config))
+                if pr.returncode != 0:
+                    raise RuntimeError(pr.stderr.strip() or "PR create failed")
+                pr_url = pr.stdout.strip()
+                record["result_url"] = pr_url
+                if execution_config.get("selected_execute_and_merge"):
+                    maybe_merge_created_pr(pr_url, item, execution_config, record)
+                    post_execute_merge = str(record.get("post_execute_merge") or "")
+                    if post_execute_merge and post_execute_merge.lower().startswith("waiting for checks:"):
+                        next_label = execution_label or "dayshift/ready"
+                        set_workflow_label(item, next_label, config)
+                        record["workflow_label"] = next_label
+                        outcome = {"status": "ready", "url": pr_url, "detail": post_execute_merge}
+                    else:
+                        set_workflow_label(item, "dayshift/done", config)
+                        record["workflow_label"] = "dayshift/done"
+                        outcome = {"status": "done", "url": pr_url, "detail": post_execute_merge}
+                else:
+                    set_workflow_label(item, "dayshift/done", config)
+                    record["workflow_label"] = "dayshift/done"
+                    outcome = {"status": "done", "url": pr_url}
         else:
             approved = "dayshift/merge" in item.labels
             checks_ok, checks_reason = github_checks_pass(item.repo, item.number, config)
@@ -1440,12 +1488,13 @@ def run_ready_items(config: dict[str, Any], *, respect_run_policy: bool = False,
             labels.add(record_label)
         classification = classifications[item.key]
         workflow_state = record_label or next((label for label in item.labels if label in workflow_labels(config)), None)
-        execution_label = next((label for label in labels if label in lane_labels), None)
-        if execution_label is None:
+        execution_label = workflow_state if workflow_state in lane_labels else None
+        if execution_label is None and item.kind == "issue" and record.get("result_url") and workflow_state == "dayshift/failed":
             fallback_execution_label = record.get("execution_label")
-            if fallback_execution_label in lane_labels and workflow_state == fallback_execution_label:
+            if fallback_execution_label in lane_labels:
                 execution_label = fallback_execution_label
-        should_run = "dayshift/ready" in labels or (item.kind == "issue" and workflow_state in lane_labels)
+        should_reconcile_existing_pr = item.kind == "issue" and workflow_state == "dayshift/failed" and bool(record.get("result_url")) and execution_label is not None
+        should_run = workflow_state == "dayshift/ready" or (item.kind == "issue" and (workflow_state in lane_labels or should_reconcile_existing_pr))
         if not config.get("kanban_enabled", True) and classification.verdict == "auto-fix":
             should_run = True
         if item.kind == "pr" and ("dayshift/merge" in labels or can_auto_merge(item, config, approved_by_label=False)):
