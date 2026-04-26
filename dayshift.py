@@ -1439,12 +1439,13 @@ def run_ready_items(config: dict[str, Any], *, respect_run_policy: bool = False,
         if record_label:
             labels.add(record_label)
         classification = classifications[item.key]
+        workflow_state = record_label or next((label for label in item.labels if label in workflow_labels(config)), None)
         execution_label = next((label for label in labels if label in lane_labels), None)
         if execution_label is None:
             fallback_execution_label = record.get("execution_label")
-            if fallback_execution_label in lane_labels:
+            if fallback_execution_label in lane_labels and workflow_state == fallback_execution_label:
                 execution_label = fallback_execution_label
-        should_run = "dayshift/ready" in labels or (item.kind == "issue" and execution_label is not None)
+        should_run = "dayshift/ready" in labels or (item.kind == "issue" and workflow_state in lane_labels)
         if not config.get("kanban_enabled", True) and classification.verdict == "auto-fix":
             should_run = True
         if item.kind == "pr" and ("dayshift/merge" in labels or can_auto_merge(item, config, approved_by_label=False)):
