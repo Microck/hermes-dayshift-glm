@@ -714,7 +714,7 @@ def set_workflow_label(item: WorkItem, label: str, config: dict[str, Any]) -> No
                 msg = str(exc)
                 if "Label does not exist" not in msg and "Must have admin rights" not in msg and "403" not in msg:
                     raise
-                print(f"  [warn] Could not remove label '{existing}' on {item.repo}#{item.number}: {msg}")
+                print(f"  [warn] Could not remove label '{existing}' on {item.repo}#{item.number}: {msg}", file=sys.stderr)
     if label not in item.labels:
         try:
             gh_api(f"/repos/{item.repo}/issues/{item.number}/labels", config, method="POST", json_body={"labels": [label]})
@@ -722,7 +722,7 @@ def set_workflow_label(item: WorkItem, label: str, config: dict[str, Any]) -> No
             msg = str(exc)
             if "Must have admin rights" not in msg and "403" not in msg:
                 raise
-            print(f"  [warn] Could not add label '{label}' on {item.repo}#{item.number}: {msg}")
+            print(f"  [warn] Could not add label '{label}' on {item.repo}#{item.number}: {msg}", file=sys.stderr)
 
 
 def save_human_note(key: str, note: str) -> dict[str, Any]:
