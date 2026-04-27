@@ -759,6 +759,9 @@ def sync_scan(config: dict[str, Any], *, apply_labels: bool = False) -> tuple[li
             classification = classify_item(item, state, config)
             classifications[item.key] = classification
             record = state.setdefault("items", {}).setdefault(item.key, {})
+            # Never overwrite state for items that are done or explicitly ignored
+            if record.get("ignored_by_dayshift") or record.get("closed_by_dayshift"):
+                continue
             github_workflow_label = next((label for label in item.labels if label in workflow_labels(config)), None)
             # The web board is the operator's source of truth. GitHub labels are
             # synced best-effort, but scans must not undo a local card move just
@@ -819,6 +822,11 @@ def clone_repo(repo: str, config: dict[str, Any]) -> Path:
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     clone_dir = WORKSPACE / repo.split("/")[-1]
     if clone_dir.exists():
+        # Ensure we're not inside the dir we're about to delete (codex may have chdir'd)
+        try:
+            os.chdir(WORKSPACE)
+        except OSError:
+            os.chdir(os.path.expanduser("~"))
         shutil.rmtree(clone_dir)
     result = run_command(["git", "clone", f"https://github.com/{repo}.git", str(clone_dir)], env=token_env(config))
     if result.returncode != 0:
@@ -1348,6 +1356,12 @@ def act_on_item(item: WorkItem, classification: Classification, config: dict[str
 
     try:
         execution_config = config_for_execution_label(config, execution_label)
+        if not execution_label:
+            set_workflow_label(item, "dayshift/failed", config)
+            record["workflow_label"] = "dayshift/failed"
+            record["last_error"] = "No execution lane assigned — cannot execute without a lane"
+            save_state(state)
+            return {"status": "failed", "error": "no execution lane assigned"}
         execution_config["human_note"] = record.get("human_note", "")
         if item.kind == "issue":
             existing_pr_outcome = reconcile_existing_issue_pr(item, execution_config, record)
