@@ -1197,29 +1197,36 @@ def can_auto_merge(item: WorkItem, config: dict[str, Any], *, approved_by_label:
     return bool(config.get("auto_merge_implement_prs"))
 
 
-def github_checks_pass(repo: str, pr_number: int, config: dict[str, Any]) -> tuple[bool, str]:
-    data = gh_api(f"/repos/{repo}/pulls/{pr_number}", config)
-    mergeable_state = data.get("mergeable_state")
-    if mergeable_state in {"dirty", "blocked", "unknown"}:
-        return False, f"mergeable_state={mergeable_state}"
+def github_checks_pass(repo: str, pr_number: int, config: dict[str, Any], *, retries: int = 3, backoff: float = 5.0) -> tuple[bool, str]:
+    """Check if a PR is mergeable. Retries on 'unknown' mergeable_state with backoff."""
+    for attempt in range(retries + 1):
+        data = gh_api(f"/repos/{repo}/pulls/{pr_number}", config)
+        mergeable_state = data.get("mergeable_state")
+        if mergeable_state == "unknown" and attempt < retries:
+            import time as _time
+            _time.sleep(backoff)
+            continue
+        if mergeable_state in {"dirty", "blocked", "unknown"}:
+            return False, f"mergeable_state={mergeable_state}"
 
-    status = run_command(
-        ["gh", "pr", "view", str(pr_number), "-R", repo, "--json", "statusCheckRollup,mergeStateStatus"],
-        env=token_env(config),
-    )
-    if status.returncode != 0:
-        return False, status.stderr.strip() or "could not read PR checks"
-    payload = json.loads(status.stdout)
-    checks = payload.get("statusCheckRollup") or []
-    if not checks:
-        merge_state_status = str(payload.get("mergeStateStatus") or "").upper()
-        if merge_state_status in {"CLEAN", "HAS_HOOKS", "UNSTABLE", "UNKNOWN"}:
-            return True, "no GitHub checks reported"
-        return False, "no GitHub checks reported"
-    failed = [check for check in checks if check.get("conclusion") not in {"SUCCESS", "SKIPPED"} and check.get("status") != "COMPLETED"]
-    if failed:
-        return False, "one or more GitHub checks are not passing"
-    return True, "checks passed"
+        status = run_command(
+            ["gh", "pr", "view", str(pr_number), "-R", repo, "--json", "statusCheckRollup,mergeStateStatus"],
+            env=token_env(config),
+        )
+        if status.returncode != 0:
+            return False, status.stderr.strip() or "could not read PR checks"
+        payload = json.loads(status.stdout)
+        checks = payload.get("statusCheckRollup") or []
+        if not checks:
+            merge_state_status = str(payload.get("mergeStateStatus") or "").upper()
+            if merge_state_status in {"CLEAN", "HAS_HOOKS", "UNSTABLE", "UNKNOWN"}:
+                return True, "no GitHub checks reported"
+            return False, "no GitHub checks reported"
+        failed = [check for check in checks if check.get("conclusion") not in {"SUCCESS", "SKIPPED"} and check.get("status") != "COMPLETED"]
+        if failed:
+            return False, "one or more GitHub checks are not passing"
+        return True, "checks passed"
+    return False, "mergeable_state=unknown after retries"
 
 
 def merge_pr(item: WorkItem, config: dict[str, Any]) -> str:
@@ -1229,6 +1236,64 @@ def merge_pr(item: WorkItem, config: dict[str, Any]) -> str:
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "gh pr merge failed")
     return result.stdout.strip()
+
+
+def item_supports_rebase(item: WorkItem) -> bool:
+    """Check if the source item has enough info for a rebase attempt."""
+    return bool(item.repo and item.number)
+
+
+def rebase_new_pr_branch(source_item: WorkItem, pr_number: int, config: dict[str, Any]) -> tuple[bool, str]:
+    """Rebase a freshly created PR branch onto the latest base. Returns (success, detail)."""
+    pr_data = gh_api(f"/repos/{source_item.repo}/pulls/{pr_number}", config)
+    head_ref = pr_data.get("head", {}).get("ref", "")
+    if not head_ref:
+        return False, "could not determine PR head ref"
+
+    clone_dir = clone_repo(source_item.repo, config)
+    run_command(["git", "fetch", "origin"], cwd=clone_dir, env=token_env(config))
+    checkout = run_command(["git", "checkout", head_ref], cwd=clone_dir)
+    if checkout.returncode != 0:
+        return False, f"could not checkout {head_ref}"
+
+    rebase = run_command(["git", "rebase", "origin/main"], cwd=clone_dir)
+    if rebase.returncode != 0:
+        # Abort rebase on conflict
+        run_command(["git", "rebase", "--abort"], cwd=clone_dir)
+        return False, f"rebase conflicts on {head_ref}"
+
+    push = run_command(["git", "push", "--force-with-lease", "origin", head_ref], cwd=clone_dir, env=token_env(config))
+    if push.returncode != 0:
+        return False, f"force push failed after rebase"
+    return True, f"rebased {head_ref} onto latest main"
+
+
+def _try_rebase_existing_pr(item: WorkItem, config: dict[str, Any]) -> tuple[bool, str]:
+    """Lightweight rebase for existing PRs — no agent run, just git rebase + force push."""
+    if not item.head_ref:
+        return False, "no head ref on item"
+    try:
+        source_repo = item.head_repo or item.repo
+        clone_dir = clone_repo(source_repo, config)
+        run_command(["git", "fetch", "origin"], cwd=clone_dir, env=token_env(config))
+        checkout = run_command(["git", "checkout", item.head_ref], cwd=clone_dir)
+        if checkout.returncode != 0:
+            return False, f"could not checkout {item.head_ref}"
+
+        rebase = run_command(["git", "rebase", "origin/main"], cwd=clone_dir)
+        if rebase.returncode != 0:
+            run_command(["git", "rebase", "--abort"], cwd=clone_dir)
+            return False, f"rebase conflicts on {item.head_ref}"
+
+        push = run_command(
+            ["git", "push", "--force-with-lease", "origin", f"HEAD:{item.head_ref}"],
+            cwd=clone_dir, env=token_env(config),
+        )
+        if push.returncode != 0:
+            return False, "force push failed after rebase"
+        return True, f"rebased {item.head_ref} onto latest main"
+    except Exception as exc:
+        return False, f"rebase error: {exc}"
 
 
 def close_work_item(item: WorkItem, config: dict[str, Any]) -> dict[str, Any]:
@@ -1311,8 +1376,19 @@ def maybe_merge_created_pr(pr_url: str, source_item: WorkItem, config: dict[str,
     )
     checks_ok, reason = github_checks_pass(source_item.repo, pr_number, config)
     if not checks_ok:
-        record["post_execute_merge"] = f"waiting for checks: {reason}"
-        return
+        # If dirty (merge conflict), attempt rebase before giving up
+        if "dirty" in reason and item_supports_rebase(source_item):
+            import time as _time
+            try:
+                rebase_ok, rebase_detail = rebase_new_pr_branch(source_item, pr_number, config)
+                if rebase_ok:
+                    _time.sleep(3)  # let GitHub recompute mergeable_state
+                    checks_ok, reason = github_checks_pass(source_item.repo, pr_number, config)
+            except Exception as exc:
+                rebase_detail = f"rebase failed: {exc}"
+        if not checks_ok:
+            record["post_execute_merge"] = f"waiting for checks: {reason}"
+            return
     record["post_execute_merge"] = merge_pr(pr_item, config)
 
 
@@ -1418,8 +1494,18 @@ def act_on_item(item: WorkItem, classification: Classification, config: dict[str
             checks_ok, checks_reason = github_checks_pass(item.repo, item.number, config)
             should_attempt_repair = bool(execution_label) or "dayshift/ready" in item.labels or approved
             if not checks_ok and should_attempt_repair:
-                record["repair"] = repair_pr_branch(item, classification, execution_config)
-                checks_ok, checks_reason = github_checks_pass(item.repo, item.number, config)
+                # Try a lightweight rebase first before the full repair (agent re-run)
+                if "dirty" in checks_reason and item.head_ref:
+                    rebase_ok, rebase_detail = _try_rebase_existing_pr(item, config)
+                    if rebase_ok:
+                        import time as _time
+                        _time.sleep(3)
+                        checks_ok, checks_reason = github_checks_pass(item.repo, item.number, config)
+                    else:
+                        record["rebase_detail"] = rebase_detail
+                if not checks_ok:
+                    record["repair"] = repair_pr_branch(item, classification, execution_config)
+                    checks_ok, checks_reason = github_checks_pass(item.repo, item.number, config)
             if checks_ok and can_auto_merge(item, config, approved_by_label=approved):
                 merge_output = merge_pr(item, config)
                 record["merge_output"] = merge_output
